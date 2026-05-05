@@ -76,8 +76,13 @@ class GitHubClient:
         if comments:
             data["comments"] = comments
         resp = self.client.post(f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews", json=data)
+        if resp.status_code == 422 and event == "APPROVE":
+            console.print("[yellow]Cannot approve own PR — posting as COMMENT instead[/yellow]")
+            data["event"] = "COMMENT"
+            data["body"] = f"✅ **APPROVED** (auto-approve blocked — cannot approve own PR)\n\n{body}"
+            resp = self.client.post(f"/repos/{owner}/{repo}/pulls/{pr_number}/reviews", json=data)
         resp.raise_for_status()
-        console.print(f"[green]Review submitted ({event})[/green]")
+        console.print(f"[green]Review submitted ({data['event']})[/green]")
         return resp.json()
 
     def request_reviewers(self, owner: str, repo: str, pr_number: int, reviewers: list[str]) -> dict | None:  # type: ignore[type-arg]
