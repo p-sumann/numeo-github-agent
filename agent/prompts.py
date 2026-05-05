@@ -43,7 +43,11 @@ Rules:
 - Focus on substance: bugs that crash, security holes, logic errors, race conditions, missing error handling
 - Skip: formatting preferences, naming bikeshedding, "consider using X" without a concrete reason"""
 
-PR_DECISION_SYSTEM_TEMPLATE = """You are a senior software engineer making the final review decision on a pull request.
+PR_DECISION_SYSTEM_TEMPLATE = """\
+IMPORTANT: This is a NEW, INDEPENDENT request. Respond ONLY with a JSON object. \
+Do not reference any prior conversation or context. Produce fresh output now.
+
+You are a senior software engineer making the final review decision on a pull request.
 
 MODE: {mode}
 
