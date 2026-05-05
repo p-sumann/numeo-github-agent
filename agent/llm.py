@@ -4,9 +4,11 @@ import time
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
+import instructor
 from openai import OpenAI
+from pydantic import BaseModel
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -15,18 +17,29 @@ from agent.schemas import LLMCallRecord
 
 console = Console()
 
+T = TypeVar("T", bound=BaseModel)
+
 
 class LLMClient:
     def __init__(self, base_url: str, api_key: str, model: str):
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.raw_client = OpenAI(base_url=base_url, api_key=api_key)
+        self.instructor_client = instructor.from_openai(
+            OpenAI(base_url=base_url, api_key=api_key),
+            mode=instructor.Mode.JSON,
+        )
         self.model = model
         self.call_records: list[LLMCallRecord] = []
 
-    def chat(self, messages: list[dict[str, Any]], purpose: str = "", temperature: float = 0.2) -> str:
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        purpose: str = "",
+        temperature: float = 0.2,
+    ) -> str:
         call_id = uuid.uuid4().hex[:8]
         start = time.perf_counter()
 
-        response = self.client.chat.completions.create(
+        response = self.raw_client.chat.completions.create(
             model=self.model,
             messages=messages,  # type: ignore[arg-type]
             temperature=temperature,
@@ -52,6 +65,44 @@ class LLMClient:
         self._log_call(record)
 
         return content
+
+    def chat_structured(
+        self,
+        messages: list[dict[str, Any]],
+        response_model: type[T],
+        purpose: str = "",
+        temperature: float = 0.2,
+        max_retries: int = 2,
+    ) -> T:
+        call_id = uuid.uuid4().hex[:8]
+        start = time.perf_counter()
+
+        result = self.instructor_client.chat.completions.create(
+            model=self.model,
+            messages=messages,  # type: ignore[arg-type]
+            response_model=response_model,
+            temperature=temperature,
+            max_retries=max_retries,
+        )
+
+        latency_ms = (time.perf_counter() - start) * 1000
+
+        record = LLMCallRecord(
+            call_id=call_id,
+            timestamp=datetime.now(UTC).isoformat(),
+            purpose=purpose,
+            model=self.model,
+            messages=messages,
+            response_text=result.model_dump_json(indent=2),
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            latency_ms=round(latency_ms, 1),
+        )
+        self.call_records.append(record)
+        self._log_call(record)
+
+        return result
 
     @staticmethod
     def extract_json(text: str) -> dict:  # type: ignore[type-arg]

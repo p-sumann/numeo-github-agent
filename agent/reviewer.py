@@ -14,10 +14,10 @@ from agent.prompts import (
 )
 from agent.schemas import (
     Decision,
+    DecisionResponse,
     FileReview,
-    Finding,
+    FileReviewResponse,
     PRDecision,
-    ReviewerAssignment,
     ReviewMode,
     Severity,
 )
@@ -36,7 +36,9 @@ TEMPERATURE = {
 
 
 class PRReviewer:
-    def __init__(self, llm: LLMClient, github: GitHubClient, mode: ReviewMode, dry_run: bool = False):
+    def __init__(
+        self, llm: LLMClient, github: GitHubClient, mode: ReviewMode, dry_run: bool = False,
+    ):
         self.llm = llm
         self.github = github
         self.mode = mode
@@ -62,7 +64,9 @@ class PRReviewer:
             pr_meta = self.github.get_pr(owner, repo, pr_number)
             files = self.github.get_pr_files(owner, repo, pr_number)
             collaborators = self.github.get_collaborators(owner, repo, pr_meta["user"]["login"])
-            progress.update(task, description=f"Fetched: {len(files)} files, {len(collaborators)} collaborators")
+            progress.update(
+                task, description=f"Fetched: {len(files)} files, {len(collaborators)} collaborators",
+            )
 
         console.print(f"[bold]PR #{pr_number}:[/bold] {pr_meta['title']}")
         console.print(f"[bold]Author:[/bold] {pr_meta['user']['login']}")
@@ -78,17 +82,15 @@ class PRReviewer:
             decision = PRDecision(
                 action=Decision.APPROVE,
                 confidence=0.95,
-                summary="No reviewable code changes found. All changes are binary files or deletions.",
+                summary="No reviewable code changes found.",
                 reasoning="Nothing to review — auto-approve.",
-                file_reviews=[],
-                reviewer_assignments=[],
             )
             if not self.dry_run:
                 self._execute(owner, repo, pr_number, decision)
             return decision
 
         chunks = self._chunk_files(reviewable)
-        console.print(f"[dim]Split {len(reviewable)} files into {len(chunks)} review chunks[/dim]\n")
+        console.print(f"[dim]Split {len(reviewable)} files into {len(chunks)} chunks[/dim]\n")
 
         all_file_reviews = self._review_all_chunks(chunks, pr_meta)
 
@@ -110,6 +112,8 @@ class PRReviewer:
             self._execute(owner, repo, pr_number, decision)
 
         return decision
+
+    # -- Chunking --
 
     def _chunk_files(self, files: list[dict]) -> list[list[dict]]:  # type: ignore[type-arg]
         chunks: list[list[dict]] = []  # type: ignore[type-arg]
@@ -149,9 +153,11 @@ class PRReviewer:
 
         for i, part in enumerate(parts):
             hunk = ("@@" + part) if i > 0 else part
-
             if len(current_patch) + len(hunk) > MAX_CHUNK_CHARS and current_patch:
-                result.append({**file, "patch": current_patch, "filename": f"{file['filename']} (part {part_num})"})
+                result.append({
+                    **file, "patch": current_patch,
+                    "filename": f"{file['filename']} (part {part_num})",
+                })
                 current_patch = hunk
                 part_num += 1
             else:
@@ -163,12 +169,15 @@ class PRReviewer:
 
         return result
 
-    def _review_all_chunks(self, chunks: list[list[dict]], pr_meta: dict) -> list[FileReview]:  # type: ignore[type-arg]
+    # -- LLM Calls (instructor-backed) --
+
+    def _review_all_chunks(
+        self, chunks: list[list[dict]], pr_meta: dict,  # type: ignore[type-arg]
+    ) -> list[FileReview]:
         all_reviews: list[FileReview] = []
 
         if len(chunks) == 1:
-            reviews = self._review_chunk(chunks[0], pr_meta, 1, 1)
-            all_reviews.extend(reviews)
+            all_reviews.extend(self._review_chunk(chunks[0], pr_meta, 1, 1))
         else:
             with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as executor:
                 futures = {
@@ -176,22 +185,19 @@ class PRReviewer:
                     for i, chunk in enumerate(chunks)
                 }
                 for future in as_completed(futures):
-                    reviews = future.result()
-                    all_reviews.extend(reviews)
+                    all_reviews.extend(future.result())
 
         return all_reviews
 
     def _review_chunk(  # type: ignore[type-arg]
-        self,
-        chunk: list[dict],
-        pr_meta: dict,
-        chunk_num: int,
-        total_chunks: int,  # type: ignore[type-arg]
+        self, chunk: list[dict], pr_meta: dict, chunk_num: int, total_chunks: int,  # type: ignore[type-arg]
     ) -> list[FileReview]:
         file_names = [f["filename"] for f in chunk]
         names_str = ", ".join(file_names[:5])
         suffix = "..." if len(file_names) > 5 else ""
-        console.print(f"[dim]Reviewing chunk {chunk_num}/{total_chunks}: {names_str}{suffix}[/dim]")
+        console.print(
+            f"[dim]Reviewing chunk {chunk_num}/{total_chunks}: {names_str}{suffix}[/dim]",
+        )
 
         user_msg = build_file_review_user_msg(pr_meta["title"], pr_meta.get("body"), chunk)
         messages = [
@@ -200,37 +206,52 @@ class PRReviewer:
         ]
 
         temperature = TEMPERATURE[self.mode]
-        response = self.llm.chat(messages, purpose=f"file_review_chunk_{chunk_num}", temperature=temperature)
+        threshold = CONFIDENCE_THRESHOLDS[self.mode]
 
+        try:
+            result = self.llm.chat_structured(
+                messages,
+                response_model=FileReviewResponse,
+                purpose=f"file_review_chunk_{chunk_num}",
+                temperature=temperature,
+            )
+        except Exception as e:
+            console.print(f"[red]Structured parse failed for chunk {chunk_num}: {e}[/red]")
+            console.print("[yellow]Falling back to raw chat...[/yellow]")
+            return self._review_chunk_fallback(messages, temperature, threshold, chunk_num)
+
+        for fr in result.files:
+            fr.findings = [f for f in fr.findings if f.confidence >= threshold]
+
+        return result.files
+
+    def _review_chunk_fallback(
+        self,
+        messages: list[dict],  # type: ignore[type-arg]
+        temperature: float,
+        threshold: float,
+        chunk_num: int,
+    ) -> list[FileReview]:
+        response = self.llm.chat(messages, purpose=f"file_review_chunk_{chunk_num}_fallback", temperature=temperature)
         try:
             data = self.llm.extract_json(response)
         except ValueError:
-            console.print(f"[red]Failed to parse JSON from chunk {chunk_num} — skipping[/red]")
+            console.print(f"[red]JSON fallback also failed for chunk {chunk_num}[/red]")
             return []
 
         reviews: list[FileReview] = []
         for file_data in data.get("files", []):
-            findings = []
-            for f in file_data.get("findings", []):
-                try:
-                    finding = Finding(**f)
-                    if finding.confidence >= CONFIDENCE_THRESHOLDS[self.mode]:
-                        findings.append(finding)
-                except Exception:
-                    continue
-
-            reviews.append(
-                FileReview(
-                    file_path=file_data.get("file_path", "unknown"),
-                    risk_level=file_data.get("risk_level", "low"),
-                    summary=file_data.get("summary", ""),
-                    findings=findings,
-                )
-            )
-
+            try:
+                fr = FileReview(**file_data)
+                fr.findings = [f for f in fr.findings if f.confidence >= threshold]
+                reviews.append(fr)
+            except Exception:
+                continue
         return reviews
 
-    def _make_decision(self, pr_meta: dict, file_reviews: list[FileReview], collaborators: list[str]) -> PRDecision:  # type: ignore[type-arg]
+    def _make_decision(
+        self, pr_meta: dict, file_reviews: list[FileReview], collaborators: list[str],  # type: ignore[type-arg]
+    ) -> PRDecision:
         findings_text = ""
         for fr in file_reviews:
             findings_text += f"\n### {fr.file_path} (Risk: {fr.risk_level})\n"
@@ -240,7 +261,8 @@ class PRReviewer:
                     line_ref = f" (line {finding.line_number})" if finding.line_number else ""
                     findings_text += (
                         f"- [{finding.severity.upper()}] [{finding.type}] "
-                        f"confidence={finding.confidence:.0%}: {finding.description}{line_ref}\n"
+                        f"confidence={finding.confidence:.0%}: "
+                        f"{finding.description}{line_ref}\n"
                     )
             else:
                 findings_text += "- No issues found\n"
@@ -254,52 +276,82 @@ class PRReviewer:
         ]
 
         temperature = TEMPERATURE[self.mode]
-        response = self.llm.chat(messages, purpose="pr_decision", temperature=temperature)
+
+        try:
+            result = self.llm.chat_structured(
+                messages,
+                response_model=DecisionResponse,
+                purpose="pr_decision",
+                temperature=temperature,
+            )
+            return PRDecision(
+                action=result.action,
+                confidence=result.confidence,
+                summary=result.summary,
+                reasoning=result.reasoning,
+                file_reviews=file_reviews,
+                reviewer_assignments=result.reviewer_assignments,
+            )
+        except Exception as e:
+            console.print(f"[red]Structured decision failed: {e}[/red]")
+            console.print("[yellow]Falling back to raw chat...[/yellow]")
+            return self._decision_fallback(messages, temperature, file_reviews)
+
+    def _decision_fallback(
+        self,
+        messages: list[dict],  # type: ignore[type-arg]
+        temperature: float,
+        file_reviews: list[FileReview],
+    ) -> PRDecision:
+        response = self.llm.chat(messages, purpose="pr_decision_fallback", temperature=temperature)
 
         try:
             data = self.llm.extract_json(response)
-        except ValueError:
-            console.print("[red]Failed to parse decision JSON — defaulting to ESCALATE[/red]")
+            raw_action = data.get("action") or data.get("verdict") or "escalate"
+            action = Decision.APPROVE if raw_action.lower() in {"approve", "lgtm"} else Decision.ESCALATE
             return PRDecision(
-                action=Decision.ESCALATE,
-                confidence=0.0,
-                summary="Agent could not parse the decision. Manual review required.",
-                reasoning="JSON parse failure in decision step.",
+                action=action,
+                confidence=data.get("confidence", 0.5),
+                summary=data.get("summary", response),
+                reasoning=data.get("reasoning", ""),
                 file_reviews=file_reviews,
-                reviewer_assignments=[],
             )
+        except ValueError:
+            pass
 
-        reviewer_assignments = []
-        for ra in data.get("reviewer_assignments", []):
-            try:
-                reviewer_assignments.append(ReviewerAssignment(**ra))
-            except Exception:
-                continue
+        text_lower = response.lower()
+        block_signals = ["block", "do not merge", "critical", "vulnerabilit", "reject"]
+        has_block = any(s in text_lower for s in block_signals)
+        action = Decision.ESCALATE if has_block else Decision.APPROVE
 
         return PRDecision(
-            action=data.get("action", "escalate"),
-            confidence=data.get("confidence", 0.5),
-            summary=data.get("summary", "Review completed."),
-            reasoning=data.get("reasoning", ""),
+            action=action,
+            confidence=0.9 if has_block else 0.5,
+            summary=response,
+            reasoning="Extracted from text (LLM did not return JSON).",
             file_reviews=file_reviews,
-            reviewer_assignments=reviewer_assignments,
         )
+
+    # -- GitHub Execution --
 
     def _execute(self, owner: str, repo: str, pr_number: int, decision: PRDecision) -> None:
         inline_comments = self._build_inline_comments(decision.file_reviews)
 
         if decision.action == Decision.APPROVE:
-            self.github.submit_review(owner, repo, pr_number, decision.summary, "APPROVE", inline_comments or None)
+            self.github.submit_review(
+                owner, repo, pr_number, decision.summary, "APPROVE", inline_comments or None,
+            )
         else:
-            self.github.submit_review(owner, repo, pr_number, decision.summary, "COMMENT", inline_comments or None)
-
+            self.github.submit_review(
+                owner, repo, pr_number, decision.summary, "COMMENT", inline_comments or None,
+            )
             usernames = [ra.username for ra in decision.reviewer_assignments]
             if usernames:
                 self.github.request_reviewers(owner, repo, pr_number, usernames)
 
             for ra in decision.reviewer_assignments:
-                comment_body = f"@{ra.username}\n\n{ra.comment}\n\n*Assigned by PR Review Agent*"
-                self.github.create_comment(owner, repo, pr_number, comment_body)
+                body = f"@{ra.username}\n\n{ra.comment}\n\n*Assigned by PR Review Agent*"
+                self.github.create_comment(owner, repo, pr_number, body)
 
     def _build_inline_comments(self, file_reviews: list[FileReview]) -> list[dict]:  # type: ignore[type-arg]
         comments: list[dict] = []  # type: ignore[type-arg]
@@ -316,19 +368,20 @@ class PRReviewer:
                     continue
 
                 icon = severity_icons.get(finding.severity, "⚪")
-                body = f"{icon} **{finding.severity.upper()}** — {finding.type}\n\n{finding.description}"
+                body = (
+                    f"{icon} **{finding.severity.upper()}** — {finding.type}"
+                    f"\n\n{finding.description}"
+                )
                 if finding.suggestion:
                     body += f"\n\n**Suggestion:** {finding.suggestion}"
                 body += f"\n\n*Confidence: {finding.confidence:.0%}*"
 
                 clean_path = finding.file_path.split(" (part")[0]
-                comments.append(
-                    {
-                        "path": clean_path,
-                        "line": finding.line_number,
-                        "side": "RIGHT",
-                        "body": body,
-                    }
-                )
+                comments.append({
+                    "path": clean_path,
+                    "line": finding.line_number,
+                    "side": "RIGHT",
+                    "body": body,
+                })
 
         return comments

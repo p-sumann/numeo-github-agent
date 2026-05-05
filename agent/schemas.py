@@ -34,6 +34,7 @@ class RiskLevel(StrEnum):
 class Decision(StrEnum):
     APPROVE = "approve"
     ESCALATE = "escalate"
+    REQUEST_CHANGES = "request_changes"
 
 
 class Finding(BaseModel):
@@ -65,6 +66,22 @@ class PRDecision(BaseModel):
     summary: str
     reasoning: str
     file_reviews: list[FileReview] = Field(default_factory=list)
+    reviewer_assignments: list[ReviewerAssignment] = Field(default_factory=list)
+
+
+class FileReviewResponse(BaseModel):
+    """Instructor response model for file-level review."""
+
+    files: list[FileReview] = Field(default_factory=list)
+
+
+class DecisionResponse(BaseModel):
+    """Instructor response model for PR-level decision."""
+
+    action: Decision
+    confidence: float = Field(ge=0.0, le=1.0)
+    summary: str = Field(description="Markdown summary for the GitHub review comment")
+    reasoning: str = Field(description="Internal reasoning (not posted to GitHub)")
     reviewer_assignments: list[ReviewerAssignment] = Field(default_factory=list)
 
 
