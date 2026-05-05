@@ -14,6 +14,31 @@ from agent.schemas import ReviewMode
 console = Console()
 
 
+def _build_github_client() -> GitHubClient:
+    app_id = os.environ.get("GITHUB_APP_ID")
+    private_key_path = os.environ.get("GITHUB_APP_PRIVATE_KEY_PATH")
+    installation_id = os.environ.get("GITHUB_APP_INSTALLATION_ID")
+
+    if app_id and private_key_path and installation_id:
+        key_path = Path(private_key_path)
+        if not key_path.exists():
+            console.print(f"[red]Private key not found: {private_key_path}[/red]")
+            sys.exit(1)
+        private_key = key_path.read_text()
+        console.print(f"[dim]Authenticating as GitHub App (ID: {app_id})[/dim]")
+        return GitHubClient.from_app(app_id, private_key, installation_id)
+
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        return GitHubClient(token=token)
+
+    console.print(
+        "[red]Set GITHUB_TOKEN or GITHUB_APP_ID + "
+        "GITHUB_APP_PRIVATE_KEY_PATH + GITHUB_APP_INSTALLATION_ID[/red]",
+    )
+    sys.exit(1)
+
+
 def main() -> None:
     load_dotenv()
 
@@ -35,17 +60,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    github_token = os.environ.get("GITHUB_TOKEN")
-    if not github_token:
-        console.print("[red]GITHUB_TOKEN environment variable is required[/red]")
-        sys.exit(1)
-
     llm_base_url = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:3456/v1")
     llm_api_key = os.environ.get("LLM_API_KEY", "sk-placeholder")
     llm_model = os.environ.get("LLM_MODEL", "claude-opus-4-6")
 
     llm = LLMClient(base_url=llm_base_url, api_key=llm_api_key, model=llm_model)
-    github = GitHubClient(token=github_token)
+    github = _build_github_client()
     mode = ReviewMode(args.mode)
 
     reviewer = PRReviewer(
